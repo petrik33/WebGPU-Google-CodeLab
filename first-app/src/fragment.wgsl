@@ -1,5 +1,5 @@
 struct FragInput {
-  @location(0) cell: vec2f,
+    @location(0) cell: vec2f,
 };
 
 @fragment

@@ -1,11 +1,15 @@
 
 import wgslVertexSource from './vertex.wgsl?raw';
 import wgslFragmetSource from './fragment.wgsl?raw';
+import wgslSimulationSource from './simulation.wgsl?raw';
 
 
 const GRID_WIDTH = 32;
 const GRID_HEIGHT = 32;
 const CANVAS_COLOR = [0.1, 0.3, 0.4, 1];
+const UPDATE_INTERVAL = 100;
+
+let step = 0;
 
 const canvas = document.getElementById("project-canvas") as HTMLCanvasElement
 
@@ -69,6 +73,116 @@ const uniformBuffer = device.createBuffer({
 
 device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
 
+const cellStateArray = new Uint32Array(GRID_WIDTH * GRID_HEIGHT);
+
+const cellStateStorage = [
+  device.createBuffer({
+    label: "Cell State A",
+    size: cellStateArray.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  }),
+  device.createBuffer({
+    label: "Cell State B",
+    size: cellStateArray.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  })
+];
+
+const generateStartingState = () => {
+  for (let i = 0; i < cellStateArray.length; ++i) {
+    cellStateArray[i] = Math.random() > 0.6 ? 1 : 0;
+  }
+}
+
+
+// UNCOMMENT AND COMMENT OUT THE PREVIOUS IMPL TO SEE THE GLIDERS
+//
+// const generateStartingState = () => {
+//   // Initialize the entire grid to 0 (dead cells)
+//   for (let i = 0; i < cellStateArray.length; ++i) {
+//     cellStateArray[i] = 0;
+//   }
+
+//   // Function to set a cell to alive (1)
+//   const setCell = (x: number, y: number) => {
+//     if (x >= 0 && x < 32 && y >= 0 && y < 32) {
+//       cellStateArray[y * 32 + x] = 1;
+//     }
+//   };
+
+//   // Function to place a glider at a specific position
+//   const placeGlider = (startX: number, startY: number) => {
+//     setCell(startX + 1, startY);
+//     setCell(startX + 2, startY + 1);
+//     setCell(startX, startY + 2);
+//     setCell(startX + 1, startY + 2);
+//     setCell(startX + 2, startY + 2);
+//   };
+
+//   // Place multiple gliders on the grid
+//   placeGlider(0, 0);  // Top-left corner
+//   placeGlider(10, 10); // Somewhere in the middle
+//   placeGlider(20, 20); // Another position
+//   placeGlider(5, 25);  // Near the bottom-left corner
+// };
+
+generateStartingState();
+device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+
+const bindGroupLayout = device.createBindGroupLayout({
+  label: "Cell Bind Group Layout",
+  entries: [{
+    binding: 0,
+    visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+    buffer: {} // Grid uniform buffer
+  }, {
+    binding: 1,
+    visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+    buffer: { type: "read-only-storage" } // Cell state input buffer
+  }, {
+    binding: 2,
+    visibility: GPUShaderStage.COMPUTE,
+    buffer: { type: "storage" } // Cell state output buffer
+  }]
+});
+
+const bindGroups = [
+  device.createBindGroup({
+    label: "Cell renderer bind group A",
+    layout: bindGroupLayout, // Updated Line
+    entries: [{
+      binding: 0,
+      resource: { buffer: uniformBuffer }
+    }, {
+      binding: 1,
+      resource: { buffer: cellStateStorage[0] }
+    }, {
+      binding: 2,
+      resource: { buffer: cellStateStorage[1] }
+    }],
+  }),
+  device.createBindGroup({
+    label: "Cell renderer bind group B",
+    layout: bindGroupLayout, // Updated Line
+
+    entries: [{
+      binding: 0,
+      resource: { buffer: uniformBuffer }
+    }, {
+      binding: 1,
+      resource: { buffer: cellStateStorage[1] }
+    }, {
+      binding: 2,
+      resource: { buffer: cellStateStorage[0] }
+    }],
+  }),
+];
+
+const pipelineLayout = device.createPipelineLayout({
+  label: "Cell Pipeline Layout",
+  bindGroupLayouts: [bindGroupLayout],
+});
+
 const cellVertexShaderModule = device.createShaderModule({
   label: "Cell Vertex Shader",
   code: wgslVertexSource
@@ -79,9 +193,14 @@ const cellFragmentShaderModule = device.createShaderModule({
   code: wgslFragmetSource,
 });
 
+const simulationShaderModule = device.createShaderModule({
+  label: "Game of Life simulation shader",
+  code: wgslSimulationSource
+});
+
 const cellPipeline = device.createRenderPipeline({
   label: "Cell pipeline",
-  layout: "auto",
+  layout: pipelineLayout,
   vertex: {
     module: cellVertexShaderModule,
     entryPoint: "vertexMain",
@@ -96,36 +215,52 @@ const cellPipeline = device.createRenderPipeline({
   }
 });
 
-const bindGroup = device.createBindGroup({
-  label: "Cell renderer bind group",
-  layout: cellPipeline.getBindGroupLayout(0),
-  entries: [{
-    binding: 0,
-    resource: { buffer: uniformBuffer }
-  }],
+const simulationPipeline = device.createComputePipeline({
+  label: "Simulation pipeline",
+  layout: pipelineLayout,
+  compute: {
+    module: simulationShaderModule,
+    entryPoint: "computeMain",
+  }
 });
 
-const encoder = device.createCommandEncoder();
+let update = () => {
+  const encoder = device.createCommandEncoder();
 
-const pass = encoder.beginRenderPass({
-  colorAttachments: [{
-    view: context.getCurrentTexture().createView(),
-    loadOp: "clear",
-    clearValue: CANVAS_COLOR,
-    storeOp: "store",
-  }]
-});
+  const computePass = encoder.beginComputePass();
 
-pass.setPipeline(cellPipeline);
-pass.setVertexBuffer(0, vertexBuffer);
+  computePass.setPipeline(simulationPipeline);
+  computePass.setBindGroup(0, bindGroups[step % 2]);
 
-pass.setBindGroup(0, bindGroup);
 
-pass.draw(vertices.length / 2, GRID_WIDTH * GRID_HEIGHT);
+  const workgroupCountX = Math.ceil(GRID_WIDTH / 8);
+  const workgroupCountY = Math.ceil(GRID_HEIGHT / 8);
+  computePass.dispatchWorkgroups(workgroupCountX, workgroupCountY);
 
-pass.end();
+  computePass.end();
 
-// Finish the command buffer and immediately submit it.
-device.queue.submit([encoder.finish()]);
+  ++step;
+
+  const pass = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: context.getCurrentTexture().createView(),
+      loadOp: "clear",
+      clearValue: CANVAS_COLOR,
+      storeOp: "store",
+    }]
+  });
+
+  pass.setPipeline(cellPipeline);
+  pass.setBindGroup(0, bindGroups[step % 2]);
+  pass.setVertexBuffer(0, vertexBuffer);
+
+  pass.draw(vertices.length / 2, GRID_WIDTH * GRID_HEIGHT);
+
+  pass.end();
+
+  device.queue.submit([encoder.finish()]);
+}
+
+setInterval(update, UPDATE_INTERVAL);
 
 
